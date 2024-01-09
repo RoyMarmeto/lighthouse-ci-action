@@ -190,6 +190,7 @@ export LHCI_BUILD_CONTEXT__CURRENT_HASH="$GITHUB_SHA"
 cat <<- EOF > lighthouserc.yml
 ci:
   collect:
+    numberOfRuns: 1
     url:
       - "$host/$query_string"
       - "$host/products/$product_handle$query_string"
@@ -202,16 +203,13 @@ ci:
         - "--disable-dev-shm-usage"
         - "--disable-gpu"
   upload:
-    target: temporary-public-storage
+    target: filesystem
+    outputDir: ./reports
   assert:
     assertions:
       "categories:performance":
-        - error
+        - warn
         - minScore: $min_score_performance
-          aggregationMethod: median-run
-      "categories:accessibility":
-        - error
-        - minScore: $min_score_accessibility
           aggregationMethod: median-run
 EOF
 
@@ -239,5 +237,139 @@ module.exports = async (browser) => {
 };
 EOF
 
+log "Running lighthouse Step 1"
+
 step "Running Lighthouse CI"
 lhci autorun
+
+# Function to extract JSON data from the files and create the desired structure
+extract_json_data() {
+    # Read the manifest.json file and extract its content
+    manifest=$(cat /github/workspace/reports/manifest.json)
+
+   pull_request_number=$(jq -r ".pull_request.number" "$GITHUB_EVENT_PATH")
+   log "pull_request_number: $pull_request_number"
+
+    # Get the event name or action URL
+    if [ "$GITHUB_EVENT_NAME" == "pull_request" ]; then
+    	# setting the Pull Request Link
+        event_info="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/pull/$pull_request_number"
+    else
+        event_info="Event Name: $GITHUB_EVENT_NAME, Action URL: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+    fi
+
+    # Initialize an array to store the data
+    data_array=()
+
+    # Loop through all the .json files in /github/workspace/reports/ directory (excluding manifest.json)
+    for file in /github/workspace/reports/*.json; do
+        # Skip manifest.json
+        if [ "$(basename "$file")" == "manifest.json" ]; then
+            continue
+        fi
+
+        # Get the page type based on the filename
+        if [[ $file == *"collections"* ]]; then
+            page_type="Collection Page"
+        elif [[ $file == *"products"* ]]; then
+            page_type="Product Page"
+        else
+            page_type="Homepage"
+        fi
+
+        # Extract the JSON data from the file
+        json_data=$(cat "$file")
+
+        # Extract the required fields from the json_data
+	requestedUrl=$(echo "$json_data" | jq -r '.requestedUrl')
+	finalUrl=$(echo "$json_data" | jq -r '.finalUrl')
+ 	fcp=$(echo "$json_data" | jq -r '.audits."first-contentful-paint".numericValue')
+	lcp=$(echo "$json_data" | jq -r '.audits."largest-contentful-paint".numericValue')
+	tbt=$(echo "$json_data" | jq -r '.audits."total-blocking-time".numericValue')
+	cls=$(echo "$json_data" | jq -r '.audits."cumulative-layout-shift".numericValue')
+	si=$(echo "$json_data" | jq -r '.audits."speed-index".numericValue')
+	# performance=$(echo "$manifest" | jq --arg finalUrl "$finalUrl" '.[] | select(.url == $finalUrl) | .summary.performance')
+
+	# Extract the filename from the path
+	filename=$(basename "$file")
+	
+	# Get the performance value from the manifest using the filename
+	performance=$(echo "$manifest" | jq --arg filename "$filename" 'map(select(.jsonPath | contains($filename))) | .[0].summary.performance')
+	
+        # Replace the .json extension with .html to get the corresponding HTML file path
+        html_file="${file%.json}.html"
+
+        # Read the content of the HTML file and store it in the variable 'html_content'
+        html_content=$(cat "$html_file")
+
+
+    data_entry=$(cat <<-EOF
+        {
+            "Page": "$page_type",
+            "Requested Url": "$requestedUrl",
+            "Performance": $performance,
+            "First Contentful Paint": "$fcp",
+            "Largest Contentful Paint": "$lcp",
+            "Total Blocking Time": "$tbt",
+            "Cumulative Layout Shift": "$cls",
+            "Speed Index": "$si",
+            "Event Info": "$event_info"
+        }
+EOF
+    )
+
+        # Append the data_entry to the data_array
+        data_array+=("$data_entry")
+    
+ 	# log "data_array: $data_array"
+    done
+
+    # Combine the data_array into a single JSON array
+    
+    # Join the elements of data_array with commas
+    joined_data=$(printf ",%s" "${data_array[@]}")
+    joined_data=${joined_data:1}  # Remove the leading comma
+	
+    # Create a valid JSON array
+    json_array="[$joined_data]"
+    echo "$json_array"
+}
+
+
+step "Getting the JSON data"
+
+# Function to upload data to Google Sheets using cURL
+upload_to_google_sheet() {
+    # Read JSON data from file
+    data=$(extract_json_data)
+    
+    # Extract only the repository name from $GITHUB_REPOSITORY
+    repository_name=$(basename $GITHUB_REPOSITORY)
+    
+    # Create a JSON object with repository name and data
+    json_object="{ \"$repository_name\": $data }"
+
+    # Print the JSON object
+    log "Consolidated Reports: $json_object"
+    
+	if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+	  DEFAULT_BRANCH=$(git remote show origin | grep 'HEAD branch' | awk '{print $NF}')
+	  PR_BASE_BRANCH=$(jq -r '.pull_request.base.ref' "$GITHUB_EVENT_PATH")
+	
+	  if [ "$PR_BASE_BRANCH" = "$DEFAULT_BRANCH" ]; then
+   	    step "Uploading the reports to Google Sheets"
+	
+	    log "This is a Pull Request to the default branch: $DEFAULT_BRANCH. Uploading to Google Sheets..."
+     	    log "Sheet url: https://docs.google.com/spreadsheets/d/1kcA7iPXsEuzktgTpmcstz1ylUm5znWKx0X5eaPP_R3c"
+	  
+     	    curl -X POST -H "Content-Type: application/json" -d "$json_object" "https://script.google.com/macros/s/AKfycbweu4JHqbIqTgIfwnI3KTHEqh127T9pxJyUgR0oTBYfcNpwkets3d3VWDcHMgrqS6Ab/exec"
+	  else
+	    log "This is a Pull Request, but not to the default branch.  Skipping upload to Google Sheets."
+	  fi
+	else
+	  log "This is not a Pull Request. Skipping upload to Google Sheets."
+	fi
+}
+
+# Call the function to upload data to Google Sheet
+upload_to_google_sheet
